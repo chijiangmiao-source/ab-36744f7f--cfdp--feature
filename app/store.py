@@ -11,7 +11,7 @@ import base64
 import binascii
 import hashlib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -47,12 +47,26 @@ class FrozenEntry:
     cap_hash: str
     verdict: dict
     pdu_count: int
+    frames: list[bytes] = field(default_factory=list)
+
+
+@dataclass
+class RepairEntry:
+    """补帧试算的冻结记录（与原审计标识空间分离，绝不改写来源结论）。"""
+    repair_id: str
+    source_audit_id: str
+    source_cap_hash: str
+    patch_hash: str
+    result: dict
+    source_pdu_count: int
+    patch_pdu_count: int
 
 
 class VerdictStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict[str, FrozenEntry] = {}
+        self._repairs: dict[str, RepairEntry] = {}
 
     def submit(self, audit_id: str, frames: list[bytes],
                verdict: dict) -> tuple[FrozenEntry, bool, Optional[FrozenEntry]]:
@@ -69,10 +83,50 @@ class VerdictStore:
                 if old.cap_hash == cap:
                     return old, False, None
                 return old, False, old
-            entry = FrozenEntry(audit_id, cap, verdict, len(frames))
+            entry = FrozenEntry(audit_id, cap, verdict, len(frames),
+                                list(frames))
             self._entries[audit_id] = entry
             return entry, True, None
 
     def get(self, audit_id: str) -> Optional[FrozenEntry]:
         with self._lock:
             return self._entries.get(audit_id)
+
+    # ------------------------------------------------ 补帧试算
+
+    def submit_repair(
+        self, repair_id: str, source_audit_id: str, source_cap_hash: str,
+        patch_frames: list[bytes], result: dict,
+        source_pdu_count: int,
+    ) -> tuple[RepairEntry, bool, Optional[RepairEntry], Optional[str]]:
+        """冻结/回放/冲突一次补帧试算。
+
+        指纹 = 来源审计标识 + 来源捕获指纹 + 补帧逐帧指纹：
+          完全一致            → (旧条目, False, None, None) 回放
+          换来源 / 来源捕获变 / 任一补帧变 → (..., 旧条目, 冲突原因)
+          新修复标识          → (新条目, True, None, None)
+        """
+        patch_hash = capture_hash(patch_frames)
+        with self._lock:
+            old = self._repairs.get(repair_id)
+            if old is not None:
+                if (old.source_audit_id == source_audit_id
+                        and old.source_cap_hash == source_cap_hash
+                        and old.patch_hash == patch_hash):
+                    return old, False, None, None
+                if old.source_audit_id != source_audit_id:
+                    why = "repair_source_changed"
+                elif old.source_cap_hash != source_cap_hash:
+                    why = "source_capture_changed"
+                else:
+                    why = "supplement_pdus_changed"
+                return old, False, old, why
+            entry = RepairEntry(repair_id, source_audit_id, source_cap_hash,
+                                patch_hash, result, source_pdu_count,
+                                len(patch_frames))
+            self._repairs[repair_id] = entry
+            return entry, True, None, None
+
+    def get_repair(self, repair_id: str) -> Optional[RepairEntry]:
+        with self._lock:
+            return self._repairs.get(repair_id)

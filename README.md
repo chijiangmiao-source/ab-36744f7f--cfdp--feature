@@ -55,12 +55,49 @@ byte1  类型相关标志（Finished: condition/delivery/status）
 - 相同 `audit_id` 但**任一方向或原始 PDU 改变** → `409 conflict`；
 - 新标识 → `201 frozen`。裁决可随时 `GET /audit/{id}` 读取。
 
+## 补帧试算（冻结捕获不改写）
+
+归档员面对已冻结为 `incomplete` 的审计，可在**不改写原捕获**的前提下，
+试算一组后续补帧能否真正补齐事务：
+
+```
+POST /audit/{audit_id}/repair
+     {"repair_id":"...","supplement":["<b64 PDU>",...]}
+GET  /audit/{audit_id}/repair/{repair_id}
+```
+
+- 系统只按来源审计标识引用其**冻结的原始捕获**，把补帧**严格追加到捕获
+  末尾**，用同一套既有规则重新裁决；来源条目的裁决与帧永不改变；
+- 成功（`verdict=closed_ok`）结果同时给出：
+  - `source`：来源审计（标识、原裁决、阶段、冻结覆盖摘要）；
+  - `original_missing`：来源原缺失区间；
+  - `supplement.covered`：补帧**实际补回**（且位于原缺口内）的字节区间；
+  - `supplement.remaining_missing`：仍未覆盖区间；
+  - `supplement.new_phase_evidence`：补帧阶段新产生的双方阶段证据
+    （NAK → missing_data_retransmitted → ACK(EOF) → Finished → ACK(Finished)），
+    便于确认 NAK 请求的字节确实已被补回；
+  - 违规定位同时给出追加序列的全局序号与补帧内相对序号；
+- 来源裁决并非 `incomplete`（`eligible=false`）、补帧不能消除原缺口
+  （仍为 `incomplete`）、补帧首帧在来源当前阶段不合法、或补帧仍产生协议
+  违约（`violation`）时，**返回新裁决而来源冻结结论保持不变**。
+
+试算冻结语义（与原审计流程相互独立）：
+
+- 相同 `repair_id` + **相同来源 + 完全相同补帧输入** → 回放首次结果
+  （`result=replayed`，200）；
+- 相同 `repair_id` 但**替换来源**（`repair_source_changed`）、**来源冻结
+  捕获变化**（`source_capture_changed`）或**任一原始补帧改变/增删/换序**
+  （`supplement_pdus_changed`）→ `409 conflict`，返回首次冻结结果；
+- 新修复标识 → `201 frozen`。
+
 ## HTTP API
 
 ```
-GET  /healthz                 健康响应
-POST /audit                   {"audit_id":"...","capture":["<b64>",...]}
-GET  /audit/{audit_id}        读取冻结裁决
+GET  /healthz                          健康响应
+POST /audit                            {"audit_id":"...","capture":["<b64>",...]}
+GET  /audit/{audit_id}                 读取冻结裁决
+POST /audit/{audit_id}/repair          {"repair_id":"...","supplement":["<b64>",...]}
+GET  /audit/{audit_id}/repair/{rid}    读取冻结的补帧试算结果
 ```
 
 `verdict.frozen` 字段：`file_length`、`received_length`、`crc32c`、
@@ -72,7 +109,7 @@ GET  /audit/{audit_id}        读取冻结裁决
 ```bash
 python3 -m app.server                       # 默认 0.0.0.0:8080
 CFDP_AUDIT_PORT=9090 python3 -m app.server  # 自定义端口
-python3 -m unittest discover -s tests       # 49 个测试
+python3 -m unittest discover -s tests       # 72 个测试
 python3 smoke.py http://127.0.0.1:8080      # HTTP 完整闭环冒烟
 ```
 
@@ -100,9 +137,10 @@ docker compose up --build web
 ```
 app/cfdp.py    PDU 编解码 + CRC32C
 app/audit.py   Class 2 审计状态机与裁决
-app/store.py   审计标识冻结/回放/冲突
+app/store.py   审计标识与补帧试算的冻结/回放/冲突
+app/repair.py  补帧试算：冻结捕获末尾严格追加补帧并重新裁决
 app/server.py  HTTP 服务（标准库）
 smoke.py       HTTP 完整闭环冒烟
 verify.sh      一次性验收脚本（verify 容器入口）
-tests/         49 个单元/HTTP 测试
+tests/         72 个单元/HTTP 测试
 ```

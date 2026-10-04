@@ -208,10 +208,23 @@ class Auditor:
         self._full_checked_crc: Optional[int] = None
         # EOF 后若存在未覆盖区间，必须先收到与之精确相等的 NAK 才允许重传补齐
         self._awaiting_nak = False
+        # 补帧试算状态：source_pdu_count=None 表示常规审计
+        self.source_pdu_count: Optional[int] = None
+        self._supplement_mask: Optional[bytearray] = None
 
     # ------------------------------------------------ 公共入口
 
-    def run(self, frames: list[bytes]) -> Verdict:
+    def run(self, frames: list[bytes],
+            source_pdu_count: Optional[int] = None) -> Verdict:
+        """逐帧裁决。
+
+        source_pdu_count 非 None 时为补帧试算：前 source_pdu_count 帧为
+        来源冻结捕获（绝不改写），其后为严格追加的补帧；状态机额外记录
+        补帧新覆盖（原为缺失）的字节，供试算结果展示。
+        """
+        self.source_pdu_count = source_pdu_count
+        if source_pdu_count is not None:
+            self._supplement_mask = bytearray()
         self.v.pdu_count = len(frames)
         for i, raw in enumerate(frames):
             try:
@@ -223,6 +236,16 @@ class Auditor:
                 return self.v
         self._finish()
         return self.v
+
+    def supplement_coverage(self) -> list[tuple[int, int]]:
+        """补帧实际新覆盖（来源中原缺失）的字节区间。"""
+        if self._supplement_mask is None:
+            return []
+        return merge_runs(self._supplement_mask)
+
+    def is_supplement_index(self, index: int) -> bool:
+        return (self.source_pdu_count is not None
+                and index >= self.source_pdu_count)
 
     # ------------------------------------------------ 内部
 
@@ -316,6 +339,8 @@ class Auditor:
             v.file_name = pdu.file_name
             self._buf = bytearray(self._size)
             self._mask = bytearray(self._size)
+            if self.source_pdu_count is not None:
+                self._supplement_mask = bytearray(self._size)
             self._awaiting_nak = False
             self.phase = PH_DATA_TRANSFER
             self._milestone(i, pdu, "metadata_issued")
@@ -366,6 +391,10 @@ class Auditor:
                 else:
                     self._buf[pos] = byte
                     self._mask[pos] = 1
+                    if (self._supplement_mask is not None
+                            and self.is_supplement_index(i)):
+                        # 仅统计来源捕获中原本缺失、由补帧新覆盖的字节
+                        self._supplement_mask[pos] = 1
             if self.phase == PH_EOF_RECOVERY:
                 self._milestone(i, pdu, "missing_data_retransmitted")
             self._snapshot()
