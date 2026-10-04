@@ -102,6 +102,66 @@ def main() -> int:
     assert body2["verdict"] == v, "回放必须返回原冻结裁决"
     print(f"[smoke] 相同捕获回放({audit_id}): 返回原冻结裁决")
 
+    # ---- 缺段修复试算：incomplete 捕获 + 补帧追加后闭环 ----
+    gap = (512, 768)
+    s, e = gap
+    crc = cfdp.crc32c(payload)
+    broken = [
+        cfdp.encode(cfdp.metadata(ENTITY, SEQ + 1, len(payload), "gap.dat")),
+        cfdp.encode(cfdp.file_data(ENTITY, SEQ + 1, 0, payload[:s])),
+        cfdp.encode(cfdp.file_data(ENTITY, SEQ + 1, e, payload[e:])),
+        cfdp.encode(cfdp.eof(ENTITY, SEQ + 1, len(payload), crc)),
+    ]
+    patch = [
+        cfdp.encode(cfdp.nak(ENTITY, SEQ + 1, [(s, e)])),
+        cfdp.encode(cfdp.file_data(ENTITY, SEQ + 1, s, payload[s:e])),
+        cfdp.encode(cfdp.ack_eof(ENTITY, SEQ + 1)),
+        cfdp.encode(cfdp.finished(ENTITY, SEQ + 1)),
+        cfdp.encode(cfdp.ack_finished(ENTITY, SEQ + 1)),
+    ]
+    gap_id = f"smoke-gap-{int(time.time())}"
+    status, body = _request("POST", f"{base}/audit", {
+        "audit_id": gap_id,
+        "capture": [base64.b64encode(f).decode("ascii") for f in broken]})
+    assert status == 201, body
+    gv = body["verdict"]
+    assert gv["verdict"] == "incomplete", gv
+    assert gv["frozen"]["missing"] == [[s, e]], gv
+    print(f"[smoke] 缺段捕获({gap_id}): incomplete，缺失区间 [[{s},{e}]]")
+
+    repair_id = f"smoke-repair-{int(time.time())}"
+    status, body = _request("POST", f"{base}/repair", {
+        "repair_id": repair_id, "audit_id": gap_id,
+        "frames": [base64.b64encode(f).decode("ascii") for f in patch]})
+    assert status == 201 and body["result"] == "frozen", body
+    r = body["repair"]
+    assert r["accepted"] is True and r["reject_reason"] is None, r
+    assert r["source_audit_id"] == gap_id, r
+    assert r["source_missing"] == [[s, e]], r
+    assert r["repair_coverage"] == [[s, e]], r
+    rv = r["verdict"]
+    assert rv["verdict"] == "closed_ok", rv
+    assert rv["frozen"]["missing"] == [], rv
+    stages = [m["stage"] for m in rv["phase_evidence"]]
+    assert stages == [
+        "metadata_issued", "eof_sent", "nak_for_uncovered",
+        "missing_data_retransmitted", "ack_eof_complete",
+        "finished_complete", "ack_finished_closed",
+    ], stages
+    print(f"[smoke] 修复试算({repair_id}): NAK 请求字节已补回，合并捕获闭环")
+
+    # 相同修复标识 + 完全相同输入 → 回放首次结果；来源冻结结论不变
+    status, body2 = _request("POST", f"{base}/repair", {
+        "repair_id": repair_id, "audit_id": gap_id,
+        "frames": [base64.b64encode(f).decode("ascii") for f in patch]})
+    assert status == 200 and body2["result"] == "replayed", body2
+    assert body2["repair"] == r, "修复回放必须返回首次冻结结果"
+    status, body3 = _request("GET", f"{base}/audit/{gap_id}")
+    assert status == 200, body3
+    assert body3["verdict"]["verdict"] == "incomplete", body3
+    assert body3["verdict"]["frozen"]["missing"] == [[s, e]], body3
+    print("[smoke] 修复回放一致，来源审计冻结结论未被改写")
+
     print("[smoke] PASS")
     return 0
 

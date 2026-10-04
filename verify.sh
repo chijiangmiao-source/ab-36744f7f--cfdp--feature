@@ -7,7 +7,7 @@ BASE_URL="${WEB_BASE_URL:-http://web:8080}"
 
 echo "[verify] (1/4) 构建检查：编译全部 Python 源并导入服务模块"
 python3 -m compileall -q app smoke.py
-python3 -c "import app.server, app.audit, app.cfdp, app.store"
+python3 -c "import app.server, app.audit, app.cfdp, app.store, app.repair"
 
 echo "[verify] (2/4) 等待审计服务健康: ${BASE_URL}"
 python3 - "${BASE_URL}" <<'PY'
@@ -28,10 +28,10 @@ print("[verify] 服务未在超时内就绪:", last)
 sys.exit(1)
 PY
 
-echo "[verify] (3/4) HTTP 冒烟：提交完整闭环捕获"
+echo "[verify] (3/4) HTTP 冒烟：完整闭环 + 缺段修复试算"
 python3 smoke.py "${BASE_URL}"
 
-echo "[verify] (4/4) 代码测试：缺段修复（精确 NAK 区间）与冲突重传（首违规定位）"
+echo "[verify] (4/4) 代码测试：缺段修复（精确 NAK 区间）、冲突重传（首违规定位）与修复试算"
 # 完整套件即包含缺段修复 TestMissingSegmentRepair 与冲突重传
 # TestViolations.test_conflicting_retransmit 及对应 HTTP 用例。
 python3 -m unittest discover -s tests -v
